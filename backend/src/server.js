@@ -9,15 +9,67 @@ const jwt = require("jsonwebtoken");
 const app = express();
 const prisma = new PrismaClient();
 
-app.use(cors());
-app.use(express.json());
+/** ---------- Config ---------- */
+const PORT = Number(process.env.PORT) || 4000;
+const NODE_ENV = process.env.NODE_ENV || "development";
+const JWT_SECRET = process.env.JWT_SECRET || "";
 
-// ---------- Rutas básicas ----------
-app.get("/", (req, res) => {
+// Permite varios orígenes separados por coma: "http://localhost:3000,http://localhost:5173"
+const DEFAULT_ORIGINS = ["http://localhost:3000", "http://localhost:5173"];
+const ALLOWED_ORIGINS = (process.env.CORS_ORIGIN || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+const originAllowlist = new Set(ALLOWED_ORIGINS.length ? ALLOWED_ORIGINS : DEFAULT_ORIGINS);
+
+app.use(
+  cors({
+    origin: (origin, cb) => {
+      // Permitir herramientas tipo curl/postman (sin origin)
+      if (!origin) return cb(null, true);
+      return originAllowlist.has(origin)
+        ? cb(null, true)
+        : cb(new Error(`CORS bloqueado para origin: ${origin}`));
+    },
+    credentials: true,
+  })
+);
+
+app.use(express.json({ limit: "1mb" }));
+
+/** ---------- Helpers ---------- */
+function isPrismaUniqueError(e) {
+  return Boolean(e && typeof e === "object" && e.code === "P2002");
+}
+
+function auth(req, res, next) {
+  const header = req.headers.authorization || "";
+  const [type, token] = header.split(" ");
+
+  if (type !== "Bearer" || !token) {
+    return res.status(401).json({ error: "Token requerido (Bearer)" });
+  }
+
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    req.user = { id: payload.sub, role: payload.role };
+    return next();
+  } catch {
+    return res.status(401).json({ error: "Token inválido o expirado" });
+  }
+}
+
+/** ---------- Router (se monta en / y en /api) ---------- */
+const router = express.Router();
+
+// Raíz
+router.get("/", (req, res) => {
   res.send("API corriendo ✅");
 });
 
-app.get("/health", async (req, res) => {
+// Health
+router.get("/health", async (req, res) => {
   try {
     await prisma.$queryRaw`SELECT 1`;
     res.json({ ok: true, db: true });
@@ -26,8 +78,8 @@ app.get("/health", async (req, res) => {
   }
 });
 
-// ---------- USERS (básico) ----------
-app.get("/users", async (req, res) => {
+// USERS (básico)
+router.get("/users", async (req, res) => {
   try {
     const users = await prisma.user.findMany({
       select: { id: true, email: true, name: true, role: true, createdAt: true },
@@ -38,55 +90,35 @@ app.get("/users", async (req, res) => {
   }
 });
 
-// OJO: Este endpoint crea usuario con password en texto plano.
-// Úsalo solo para pruebas. En producción usar /auth/register.
-app.post("/users", async (req, res) => {
-  const { email, password, name } = req.body;
+// Este endpoint queda SOLO para desarrollo y además HASHEA password
+router.post("/users", async (req, res) => {
+  if (NODE_ENV !== "development") {
+    return res.status(404).json({ error: "Not found" });
+  }
 
+  const { email, password, name } = req.body;
   if (!email || !password || !name) {
     return res.status(400).json({ error: "email, password y name son obligatorios" });
   }
 
   try {
+    const passwordHash = await bcrypt.hash(password, 10);
     const user = await prisma.user.create({
-      data: { email, password, name },
+      data: { email, password: passwordHash, name },
+      select: { id: true, email: true, name: true, role: true, createdAt: true },
     });
 
-    res.status(201).json({
-      id: user.id,
-      email: user.email,
-      name: user.name,
-      role: user.role,
-      createdAt: user.createdAt,
-    });
+    res.status(201).json(user);
   } catch (e) {
-    if (String(e).includes("Unique constraint")) {
+    if (isPrismaUniqueError(e) || String(e).includes("Unique constraint")) {
       return res.status(409).json({ error: "Ese email ya existe" });
     }
     res.status(500).json({ error: "Error creando usuario", detail: String(e?.message || e) });
   }
 });
 
-// ---------- Auth middleware ----------
-function auth(req, res, next) {
-  const header = req.headers.authorization || "";
-  const [type, token] = header.split(" ");
-
-  if (type !== "Bearer" || !token) {
-    return res.status(401).json({ error: "Token requerido (Bearer)" });
-  }
-
-  try {
-    const payload = jwt.verify(token, process.env.JWT_SECRET);
-    req.user = { id: payload.sub, role: payload.role };
-    next();
-  } catch {
-    return res.status(401).json({ error: "Token inválido o expirado" });
-  }
-}
-
-// ---------- AUTH ----------
-app.post("/auth/register", async (req, res) => {
+// AUTH
+router.post("/auth/register", async (req, res) => {
   const { email, password, name } = req.body;
 
   if (!email || !password || !name) {
@@ -106,7 +138,7 @@ app.post("/auth/register", async (req, res) => {
 
     const token = jwt.sign(
       { sub: user.id, role: user.role },
-      process.env.JWT_SECRET,
+      JWT_SECRET,
       { expiresIn: process.env.JWT_EXPIRES_IN || "7d" }
     );
 
@@ -116,9 +148,8 @@ app.post("/auth/register", async (req, res) => {
   }
 });
 
-app.post("/auth/login", async (req, res) => {
+router.post("/auth/login", async (req, res) => {
   const { email, password } = req.body;
-
   if (!email || !password) {
     return res.status(400).json({ error: "email y password son obligatorios" });
   }
@@ -132,7 +163,7 @@ app.post("/auth/login", async (req, res) => {
 
     const token = jwt.sign(
       { sub: user.id, role: user.role },
-      process.env.JWT_SECRET,
+      JWT_SECRET,
       { expiresIn: process.env.JWT_EXPIRES_IN || "7d" }
     );
 
@@ -146,7 +177,7 @@ app.post("/auth/login", async (req, res) => {
 });
 
 // Ruta protegida de prueba
-app.get("/me", auth, async (req, res) => {
+router.get("/me", auth, async (req, res) => {
   try {
     const user = await prisma.user.findUnique({
       where: { id: req.user.id },
@@ -158,8 +189,8 @@ app.get("/me", auth, async (req, res) => {
   }
 });
 
-// ---------- TASKS (protegidas por usuario) ----------
-app.get("/tasks", auth, async (req, res) => {
+// TASKS (protegidas por usuario)
+router.get("/tasks", auth, async (req, res) => {
   try {
     const tasks = await prisma.task.findMany({
       where: { userId: req.user.id },
@@ -171,13 +202,13 @@ app.get("/tasks", auth, async (req, res) => {
   }
 });
 
-app.post("/tasks", auth, async (req, res) => {
+router.post("/tasks", auth, async (req, res) => {
   const { title } = req.body;
   if (!title) return res.status(400).json({ error: "title es obligatorio" });
 
   try {
     const task = await prisma.task.create({
-      data: { title, userId: req.user.id },
+      data: { title: String(title).trim(), userId: req.user.id },
     });
     res.status(201).json(task);
   } catch (e) {
@@ -185,11 +216,20 @@ app.post("/tasks", auth, async (req, res) => {
   }
 });
 
-app.patch("/tasks/:id", auth, async (req, res) => {
+router.patch("/tasks/:id", auth, async (req, res) => {
   const id = Number(req.params.id);
   const { title, completed } = req.body;
 
   if (Number.isNaN(id)) return res.status(400).json({ error: "id inválido" });
+
+  const data = {
+    ...(title !== undefined ? { title: String(title).trim() } : {}),
+    ...(completed !== undefined ? { completed: Boolean(completed) } : {}),
+  };
+
+  if (Object.keys(data).length === 0) {
+    return res.status(400).json({ error: "Nada que actualizar" });
+  }
 
   try {
     const existing = await prisma.task.findFirst({
@@ -199,10 +239,7 @@ app.patch("/tasks/:id", auth, async (req, res) => {
 
     const updated = await prisma.task.update({
       where: { id },
-      data: {
-        ...(title !== undefined ? { title } : {}),
-        ...(completed !== undefined ? { completed: Boolean(completed) } : {}),
-      },
+      data,
     });
 
     res.json(updated);
@@ -211,7 +248,7 @@ app.patch("/tasks/:id", auth, async (req, res) => {
   }
 });
 
-app.delete("/tasks/:id", auth, async (req, res) => {
+router.delete("/tasks/:id", auth, async (req, res) => {
   const id = Number(req.params.id);
   if (Number.isNaN(id)) return res.status(400).json({ error: "id inválido" });
 
@@ -228,35 +265,40 @@ app.delete("/tasks/:id", auth, async (req, res) => {
   }
 });
 
-// ---------- Start ----------
-const PORT = process.env.PORT || 3000;
+// Montamos en / y en /api para compatibilidad
+app.use(router);
+app.use("/api", router);
 
+/** ---------- Start + shutdown ---------- */
 async function start() {
-  try {
-    if (!process.env.JWT_SECRET) {
-      console.warn("⚠️ Falta JWT_SECRET en .env (Auth no funcionará bien)");
-    }
-
-    await prisma.$connect();
-    console.log("✅ Prisma conectado a la DB");
-
-    app.listen(PORT, () => {
-      console.log(`✅ API corriendo en http://localhost:${PORT}`);
-    });
-  } catch (err) {
-    console.error("❌ Error al iniciar:", err);
-    process.exit(1);
+  if (!JWT_SECRET) {
+    throw new Error("Falta JWT_SECRET en el .env");
   }
+
+  await prisma.$connect();
+  console.log("✅ Prisma conectado a la DB");
+
+  const server = app.listen(PORT, () => {
+    console.log(`✅ API corriendo en http://localhost:${PORT}`);
+  });
+
+  const shutdown = async (signal) => {
+    try {
+      console.log(`\n🛑 ${signal} recibido. Cerrando...`);
+      server.close(async () => {
+        await prisma.$disconnect();
+        process.exit(0);
+      });
+    } catch {
+      process.exit(1);
+    }
+  };
+
+  process.on("SIGINT", () => shutdown("SIGINT"));
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
 }
 
-start();
-
-// Cierre limpio
-process.on("SIGINT", async () => {
-  await prisma.$disconnect();
-  process.exit(0);
-});
-process.on("SIGTERM", async () => {
-  await prisma.$disconnect();
-  process.exit(0);
+start().catch((err) => {
+  console.error("❌ Error al iniciar:", err);
+  process.exit(1);
 });
